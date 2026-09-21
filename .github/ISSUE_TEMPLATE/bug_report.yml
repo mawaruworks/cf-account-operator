@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible defect without including account secrets.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include cookies, tokens, Live View URLs, private screenshots, or account identifiers.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the expected and actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include sanitized steps and relevant versions.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Browser Gateway version
+    validations:
+      required: true
+  - type: checkboxes
+    id: sanitized
+    attributes:
+      label: Secret check
+      options:
+        - label: I removed all credentials, Live View URLs, cookies, and private content.
+          required: true

@@ -1,0 +1,2 @@
+MCP_API_KEY="replace-with-a-long-random-secret"
+PROFILE_ENCRYPTION_KEY="replace-with-64-hex-characters"
