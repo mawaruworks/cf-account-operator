@@ -10,7 +10,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, service: "cf-account-operator", version: "0.1.0" });
+      return Response.json({ ok: true, service: "cf-account-operator", version: "0.2.0" });
     }
     if (url.pathname !== "/mcp") return new Response("Not found", { status: 404 });
     if (!isAuthorized(request, env.MCP_API_KEY)) {

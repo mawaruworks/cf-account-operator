@@ -9,7 +9,7 @@ CF Account Operator is designed for people who want an AI client such as Codex t
 
 ## Status
 
-This is an early v0.1 proof of concept. It supports:
+This is an early proof of concept. It supports:
 
 - Remote MCP over Streamable HTTP at `/mcp`
 - Bearer-token authentication, failing closed when unconfigured
@@ -18,10 +18,25 @@ This is an early v0.1 proof of concept. It supports:
 - Human login through Browser Run Live View
 - AES-256-GCM encrypted, versioned Playwright storage state in R2
 - Safe note draft creation that never clicks Publish
+- Rendered-DOM note history inspection
+- Explicitly confirmed note publishing
 - Idempotency keys for draft tasks
 - Domain allowlisting and task leases
+- A local CDP MCP runner with one persistent Chrome profile per account
 
-It does **not** yet support publishing, arbitrary browser instructions, local-runner fallback, or a production OAuth flow.
+It does **not** support arbitrary browser instructions or a production OAuth flow.
+
+## Backend order
+
+The intended backend order is:
+
+```text
+CDP (local account-specific Chrome profile)
+  > CUA (Codex In-App Browser, visible when human interaction is needed)
+  > CF (this Cloudflare Browser Run worker)
+```
+
+The local CDP runner is the first implementation of that routing. The existing worker remains the `cf` fallback and keeps its Cloudflare Browser Run/Live View flow.
 
 ## Architecture
 
@@ -95,19 +110,23 @@ The MCP endpoint will be `https://<worker>.<account>.workers.dev/mcp`. The unaut
 
 1. Call `account_upsert` with a stable ID such as `note-history`.
 2. Call `account_login_start` and open the returned Live View URL.
-3. Log in yourself, complete MFA/CAPTCHA, and select **Done**.
+3. Log in yourself, complete MFA/CAPTCHA, and select **Done**. The agent never receives or enters the credentials.
 4. Call `account_login_complete` with the returned task ID.
-5. Call `note_draft_create` with a unique idempotency key.
-6. Open note normally and review the draft before publishing it yourself.
+5. Confirm `account_status` reports `authentication.state: "authenticated"`.
+6. Call `note_draft_create` with a unique idempotency key.
+7. Open note normally and review the draft before publishing it yourself, or call `note_publish` with explicit confirmation and an idempotency key.
 
 Available tools:
 
 - `account_upsert`
+- `account_backend_status`
 - `accounts_list`
 - `account_status`
 - `account_login_start`
 - `account_login_complete`
 - `note_draft_create`
+- `note_posts_list`
+- `note_publish`
 - `task_get`
 
 ## Local development
@@ -125,7 +144,75 @@ Run checks:
 ```bash
 npm test
 npm run check
+npm run check:local
 ```
+
+### Local CDP MCP
+
+Use this when Codex should operate separate local Chrome profiles without routing through Cloudflare Browser Run:
+
+```bash
+npm run cdp:mcp
+```
+
+The MCP server stores account metadata and persistent Chrome profiles outside the repository by default:
+
+```text
+~/.config/cf-account-operator/note-accounts/<account-id>/chrome-profile
+```
+
+Set `NOTE_PROFILE_ROOT` to an absolute directory to change the root, and `NOTE_CHROME_PATH` when Chrome is not at the macOS default path. `NOTE_BROWSER_BACKEND=auto` uses the shared order `cdp > cua > cf`; the local server currently implements `cdp` and reports the other two as fallbacks.
+
+The local tools include `account_upsert`, `account_login_start`, `account_login_complete`, `account_status`, `account_browser_stop`, `note_posts_list`, `note_draft_create`, and `note_publish`. The manual login flow is:
+
+1. Call `account_login_start`.
+2. Log in manually in the opened headed, account-specific Chrome window and complete MFA/CAPTCHA yourself.
+3. You may leave Chrome open or close it after logging in. Call `account_login_complete`; it verifies the live session or re-opens the persisted profile, closes only the account browser, and preserves the profile.
+4. If `account_status` reports `login_required`, repeat the flow. If a login window is still active, finish it or call `account_browser_stop` before any other operation for that account.
+
+Routine DOM operations launch the same profile through localhost-only CDP and close the browser afterward. The current note editor requires headed Chrome for draft and publish flows; authentication checks and history inspection may use headless Chrome. `account_status` performs a read-only authentication check and never asks Codex to handle credentials.
+
+Install the repository skill when using Codex from this checkout: `.agents/skills/note-account-operator/SKILL.md`.
+
+### Chrome DevTools MCP
+
+The account workflow uses the official Chrome DevTools MCP with one persistent Chrome profile per account. Account IDs are not limited to ten; use any valid lowercase ID and switch by restarting the single profile owner:
+
+Install the MCP once globally:
+
+```bash
+npm install --global chrome-devtools-mcp@latest
+chrome-devtools-mcp --help
+```
+
+Or keep it inside a designated folder for this checkout:
+
+```bash
+npm install --prefix .tools/chrome-devtools-mcp chrome-devtools-mcp@latest
+export NOTE_CHROME_DEVTOOLS_MCP_DIR="$(pwd)/.tools/chrome-devtools-mcp"
+```
+
+The launcher prefers `NOTE_CHROME_DEVTOOLS_MCP_BIN`, then `NOTE_CHROME_DEVTOOLS_MCP_DIR`, then a global `chrome-devtools-mcp` on `PATH`; if none is available, it falls back to `npx`. Do not put the MCP package inside an account's Chrome profile directory.
+
+```bash
+NOTE_ACCOUNT_ID=note-account-10 npm run chrome-devtools:mcp -- --chrome-arg=--start-minimized
+# or override the environment value directly:
+npm run chrome-devtools:mcp -- --account-id=note-account-10 --chrome-arg=--start-minimized
+```
+
+The checked-in `.codex/config.toml` keeps `note-account-1` as the current default:
+
+```toml
+[mcp_servers.chrome_devtools]
+command = "npm"
+args = ["run", "chrome-devtools:mcp", "--", "--chrome-arg=--start-minimized"]
+cwd = "."
+env = { NOTE_ACCOUNT_ID = "note-account-1" }
+```
+
+The launcher maps each selected account to `<profile-root>/<account-id>/chrome-profile`, where `profile-root` is `NOTE_PROFILE_ROOT` or the platform config directory, starts headed Chrome minimized, and opts out of usage statistics. Profiles are local credentials: another person must log in on their own machine; do not copy or share the Chrome profile. Reload the Codex session after changing MCP configuration so the `chrome_devtools` tools are discovered. To attach to an already running debuggable Chrome instead, use the official server's `--browser-url` or `--auto-connect` option.
+
+See the [Chrome DevTools MCP project](https://github.com/ChromeDevTools/chrome-devtools-mcp) for its current configuration and connection options.
 
 ## Security model
 
@@ -135,7 +222,7 @@ npm run check
 - Live View URLs are short-lived bearer credentials. Never log or publish them.
 - The browser adapter accepts only explicit HTTPS hostnames.
 - Known-site adapters are preferred over model-driven arbitrary browsing.
-- v0.1 intentionally has no Publish tool.
+- Publishing is an explicit separate tool and requires `confirm=true`; draft creation never publishes.
 
 For internet-facing production deployments, put Cloudflare Access or an OAuth-capable gateway in front of `/mcp` in addition to the bearer secret.
 

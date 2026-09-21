@@ -1,14 +1,14 @@
-import type { BrowserContext, Page } from "@cloudflare/playwright";
-import { assertAllowedUrl } from "./security";
-import type { NotePostSummary } from "./types";
+import type { BrowserContext, Page } from "playwright-core";
+import type { NotePostSummary } from "./types.js";
 
-const NOTE_HOSTS = new Set(["note.com", "www.note.com", "editor.note.com"]);
-const NOTE_LOGIN_URL = "https://note.com/login";
-const COMPOSER_URL = "https://note.com/notes/new";
+export const NOTE_HOSTS = new Set(["note.com", "www.note.com", "editor.note.com"]);
+export const NOTE_LOGIN_URL = "https://note.com/login";
+export const NOTE_COMPOSER_URL = "https://note.com/notes/new";
 
 export class AuthenticationRequiredError extends Error {
   constructor() {
     super("The note session is not authenticated. Run account_login_start first.");
+    this.name = "AuthenticationRequiredError";
   }
 }
 
@@ -17,9 +17,11 @@ export interface NoteAuthenticationStatus {
   url: string;
 }
 
-export async function openNoteLogin(page: Page): Promise<void> {
+export async function openNoteLogin(context: BrowserContext): Promise<Page> {
+  const page = await getWorkingPage(context);
   await page.goto(NOTE_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  assertAllowedUrl(page.url(), NOTE_HOSTS);
+  assertNoteUrl(page.url());
+  return page;
 }
 
 export async function isNoteAuthenticated(context: BrowserContext): Promise<boolean> {
@@ -27,9 +29,9 @@ export async function isNoteAuthenticated(context: BrowserContext): Promise<bool
 }
 
 export async function getNoteAuthenticationStatus(context: BrowserContext): Promise<NoteAuthenticationStatus> {
-  const page = context.pages()[0] ?? (await context.newPage());
+  const page = await getWorkingPage(context);
   await gotoComposer(page);
-  assertAllowedUrl(page.url(), NOTE_HOSTS);
+  assertNoteUrl(page.url());
   return { authenticated: !isNoteLoginUrl(page.url()), url: page.url() };
 }
 
@@ -42,29 +44,12 @@ export async function createNoteDraft(
   title: string,
   body: string,
 ): Promise<{ url: string }> {
-  const page = await context.newPage();
+  const page = await prepareComposer(context, title, body);
   try {
-    await page.goto(COMPOSER_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    assertAllowedUrl(page.url(), NOTE_HOSTS);
-    if (/\/login(?:[/?#]|$)/.test(new URL(page.url()).pathname)) throw new AuthenticationRequiredError();
-
-    const titleLocator = page
-      .locator('textarea[placeholder*="タイトル"], input[placeholder*="タイトル"], [contenteditable="true"][data-placeholder*="タイトル"]')
-      .first();
-    await titleLocator.waitFor({ state: "visible", timeout: 20_000 });
-    await titleLocator.fill(title);
-
-    const editable = page.locator('.ProseMirror[contenteditable="true"], [contenteditable="true"][role="textbox"]').last();
-    await editable.waitFor({ state: "visible", timeout: 20_000 });
-    await editable.fill(body);
-
-    // note normally autosaves. If a dedicated draft-save button exists, it is safe to use;
-    // this adapter intentionally never clicks a publish button.
     const saveButton = page.getByRole("button", { name: /下書き保存|保存する/ }).first();
     if (await saveButton.isVisible().catch(() => false)) await saveButton.click();
-
     await page.waitForTimeout(2_000);
-    assertAllowedUrl(page.url(), NOTE_HOSTS);
+    assertNoteUrl(page.url());
     return { url: page.url() };
   } finally {
     await page.close();
@@ -87,7 +72,7 @@ export async function publishNote(
     await publishButton.click();
     const updateButton = page.getByRole("button", { name: /^更新する$/ }).last();
     await updateButton.waitFor({ state: "visible", timeout: 30_000 });
-    const editorUrl = assertAllowedUrl(page.url(), NOTE_HOSTS);
+    const editorUrl = assertNoteUrl(page.url());
     const match = editorUrl.pathname.match(/^\/notes\/([^/]+)\/publish\/?$/);
     const noteId = match?.[1];
     if (!noteId) throw new Error("Publish succeeded but the editor article ID could not be resolved");
@@ -102,12 +87,12 @@ export async function listNotePosts(
   creatorUrl: string,
   limit: number,
 ): Promise<{ url: string; posts: NotePostSummary[] }> {
-  assertAllowedUrl(creatorUrl, NOTE_HOSTS);
+  assertNoteUrl(creatorUrl);
   await requireNoteAuthentication(context);
-  const page = context.pages()[0] ?? (await context.newPage());
+  const page = await getWorkingPage(context);
   try {
     await page.goto(creatorUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    assertAllowedUrl(page.url(), NOTE_HOSTS);
+    assertNoteUrl(page.url());
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
     const candidates = await page.locator('a[href*="/n/"]').evaluateAll((elements) =>
       elements.map((element) => {
@@ -150,14 +135,22 @@ export function normalizePostLinks(
   return results;
 }
 
+export function assertNoteUrl(value: string): URL {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || !NOTE_HOSTS.has(url.hostname)) {
+    throw new Error(`Navigation blocked: ${url.hostname}`);
+  }
+  return url;
+}
+
 export function isNoteLoginUrl(value: string): boolean {
   return /\/login(?:[/?#]|$)/.test(new URL(value).pathname);
 }
 
 async function prepareComposer(context: BrowserContext, title: string, body: string): Promise<Page> {
-  const page = context.pages()[0] ?? (await context.newPage());
+  const page = await getWorkingPage(context);
   await gotoComposer(page);
-  assertAllowedUrl(page.url(), NOTE_HOSTS);
+  assertNoteUrl(page.url());
   if (isNoteLoginUrl(page.url())) throw new AuthenticationRequiredError();
 
   const titleLocator = page
@@ -174,9 +167,13 @@ async function prepareComposer(context: BrowserContext, title: string, body: str
   return page;
 }
 
+async function getWorkingPage(context: BrowserContext): Promise<Page> {
+  return context.pages()[0] ?? context.newPage();
+}
+
 async function gotoComposer(page: Page): Promise<void> {
   try {
-    await page.goto(COMPOSER_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    await page.goto(NOTE_COMPOSER_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
   } catch (error) {
     if (!isExpectedNavigationAbort(error)) throw error;
   }
@@ -189,7 +186,7 @@ async function resolvePublishedUrl(page: Page, noteId: string): Promise<string> 
   } catch (error) {
     if (!isExpectedNavigationAbort(error)) throw error;
   }
-  assertAllowedUrl(page.url(), NOTE_HOSTS);
+  assertNoteUrl(page.url());
   await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
   const url = new URL(page.url());
   if (!/^\/[^/]+\/n\/[^/]+\/?$/.test(url.pathname)) {
