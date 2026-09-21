@@ -1,0 +1,8 @@
+[mcp_servers.chrome_devtools]
+command = "npm"
+args = ["run", "chrome-devtools:mcp", "--", "--chrome-arg=--start-minimized"]
+cwd = "."
+env = { NOTE_ACCOUNT_ID = "note-account-1" }
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+default_tools_approval_mode = "writes"

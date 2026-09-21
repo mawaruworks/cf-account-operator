@@ -40,4 +40,10 @@ describe("navigation allowlist", () => {
     expect(() => assertAllowedUrl("http://note.com/login", new Set(["note.com"]))).toThrow();
     expect(() => assertAllowedUrl("https://evil.example", new Set(["note.com"]))).toThrow();
   });
+
+  it("allows note's editor host when explicitly included", () => {
+    expect(assertAllowedUrl("https://editor.note.com/notes/new", new Set(["note.com", "editor.note.com"])).hostname).toBe(
+      "editor.note.com",
+    );
+  });
 });

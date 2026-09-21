@@ -1,6 +1,6 @@
 {
   "name": "cf-account-operator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A self-hosted, human-in-the-loop browser automation gateway for Cloudflare Browser Run and MCP.",
   "type": "module",
   "private": true,
@@ -11,6 +11,9 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
+    "check:local": "tsc -p tsconfig.local.json --noEmit",
+    "cdp:mcp": "tsx local/server.ts",
+    "chrome-devtools:mcp": "node local/chrome-devtools-mcp.mjs",
     "dev": "wrangler dev --remote",
     "deploy": "wrangler deploy",
     "test": "vitest run",
@@ -24,6 +27,9 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260920.1",
+    "@types/node": "^26.6.2",
+    "playwright-core": "^1.63.0",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1",
     "wrangler": "^4.135.0"

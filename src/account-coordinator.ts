@@ -1,8 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import { launch, type Browser, type BrowserContext, type Page } from "@cloudflare/playwright";
-import { createNoteDraft, openNoteLogin } from "./note-adapter";
+import { createNoteDraft, isNoteAuthenticated, listNotePosts, openNoteLogin, publishNote } from "./note-adapter";
 import { ProfileStore } from "./profile-store";
-import type { CoordinatorStatus, DraftResult, Env, LoginStartResult } from "./types";
+import type {
+  AuthenticationStatus,
+  CoordinatorStatus,
+  DraftResult,
+  Env,
+  LoginStartResult,
+  NotePostsResult,
+  PublishResult,
+} from "./types";
 
 const LEASE_MS = 10 * 60 * 1_000;
 
@@ -34,6 +42,24 @@ export class AccountCoordinator extends DurableObject<Env> {
         case "/draft/create":
           return Response.json(
             await this.createDraft(
+              accountId,
+              this.requiredString(body.taskId, "taskId"),
+              this.requiredString(body.title, "title"),
+              this.requiredString(body.body, "body"),
+            ),
+          );
+        case "/posts/list":
+          return Response.json(
+            await this.listPosts(
+              accountId,
+              this.requiredString(body.taskId, "taskId"),
+              this.requiredString(body.creatorUrl, "creatorUrl"),
+              this.requiredNumber(body.limit, "limit"),
+            ),
+          );
+        case "/publish":
+          return Response.json(
+            await this.publish(
               accountId,
               this.requiredString(body.taskId, "taskId"),
               this.requiredString(body.title, "title"),
@@ -105,7 +131,7 @@ export class AccountCoordinator extends DurableObject<Env> {
       await this.release(state.profileVersion);
       throw new Error("The login browser expired. Start the login flow again.");
     }
-    if (/\/login(?:[/?#]|$)/.test(new URL(this.page.url()).pathname)) {
+    if (!(await isNoteAuthenticated(this.context))) {
       throw new Error("Login does not appear to be complete yet");
     }
     const profiles = new ProfileStore(this.env.PROFILES, this.env.PROFILE_ENCRYPTION_KEY);
@@ -130,6 +156,52 @@ export class AccountCoordinator extends DurableObject<Env> {
         const profileVersion = await profiles.save(accountId, updatedState);
         await this.release(profileVersion);
         return { taskId, status: "succeeded", url: result.url, profileVersion };
+      } finally {
+        await browser.close();
+      }
+    } catch (error) {
+      await this.release(state.profileVersion);
+      throw error;
+    }
+  }
+
+  private async listPosts(accountId: string, taskId: string, creatorUrl: string, limit: number): Promise<NotePostsResult> {
+    const state = await this.acquire(taskId, "running");
+    const profiles = new ProfileStore(this.env.PROFILES, this.env.PROFILE_ENCRYPTION_KEY);
+    try {
+      const storageState = await profiles.load(accountId, state.profileVersion);
+      if (!storageState) throw new Error("No login profile exists. Run account_login_start first.");
+      const browser = await launch(this.env.BROWSER);
+      try {
+        const context = await browser.newContext({ storageState });
+        const result = await listNotePosts(context, creatorUrl, limit);
+        const updatedState = await context.storageState({ indexedDB: true });
+        const profileVersion = await profiles.save(accountId, updatedState);
+        await this.release(profileVersion);
+        return { taskId, status: "succeeded", ...result, profileVersion };
+      } finally {
+        await browser.close();
+      }
+    } catch (error) {
+      await this.release(state.profileVersion);
+      throw error;
+    }
+  }
+
+  private async publish(accountId: string, taskId: string, title: string, body: string): Promise<PublishResult> {
+    const state = await this.acquire(taskId, "running");
+    const profiles = new ProfileStore(this.env.PROFILES, this.env.PROFILE_ENCRYPTION_KEY);
+    try {
+      const storageState = await profiles.load(accountId, state.profileVersion);
+      if (!storageState) throw new Error("No login profile exists. Run account_login_start first.");
+      const browser = await launch(this.env.BROWSER);
+      try {
+        const context = await browser.newContext({ storageState });
+        const result = await publishNote(context, title, body);
+        const updatedState = await context.storageState({ indexedDB: true });
+        const profileVersion = await profiles.save(accountId, updatedState);
+        await this.release(profileVersion);
+        return { taskId, status: "succeeded", ...result, profileVersion };
       } finally {
         await browser.close();
       }
@@ -169,7 +241,46 @@ export class AccountCoordinator extends DurableObject<Env> {
 
   private async status(accountId: string): Promise<CoordinatorStatus> {
     const state = await this.readState();
-    return { accountId, ...state };
+    return { accountId, ...state, authentication: await this.authenticationStatus(accountId, state) };
+  }
+
+  private async authenticationStatus(accountId: string, state: PersistentState): Promise<AuthenticationStatus> {
+    if (state.status === "needs_human") {
+      return {
+        state: "needs_human",
+        authenticated: null,
+        next: "Finish the visible login handoff, then call account_login_complete.",
+      };
+    }
+    if (state.status === "running") {
+      return { state: "busy", authenticated: null, next: "Wait for the current account task to finish." };
+    }
+
+    const profiles = new ProfileStore(this.env.PROFILES, this.env.PROFILE_ENCRYPTION_KEY);
+    const storageState = await profiles.load(accountId, state.profileVersion);
+    if (!storageState) {
+      return {
+        state: "login_required",
+        authenticated: false,
+        next: "Call account_login_start and complete the login manually.",
+      };
+    }
+
+    const browser = await launch(this.env.BROWSER);
+    try {
+      const context = await browser.newContext({ storageState });
+      const authenticated = await isNoteAuthenticated(context);
+      return authenticated
+        ? { state: "authenticated", authenticated: true, checkedUrl: context.pages()[0]?.url() }
+        : {
+            state: "login_required",
+            authenticated: false,
+            checkedUrl: context.pages()[0]?.url(),
+            next: "Call account_login_start and complete the login manually.",
+          };
+    } finally {
+      await browser.close();
+    }
   }
 
   private async readState(): Promise<PersistentState> {
@@ -192,6 +303,13 @@ export class AccountCoordinator extends DurableObject<Env> {
 
   private requiredString(value: unknown, name: string): string {
     if (typeof value !== "string" || value.length === 0) throw new Error(`${name} is required`);
+    return value;
+  }
+
+  private requiredNumber(value: unknown, name: string): number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 100) {
+      throw new Error(`${name} must be an integer between 1 and 100`);
+    }
     return value;
   }
 }

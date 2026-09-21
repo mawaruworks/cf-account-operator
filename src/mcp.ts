@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { BACKEND_PRIORITY } from "./backend";
 import { createTask, getTask, listAccounts, requireAccount, updateTask, upsertAccount } from "./database";
 import { isValidAccountId } from "./security";
 import type { Env } from "./types";
@@ -29,7 +30,16 @@ async function callCoordinator(env: Env, accountId: string, path: string, body: 
 }
 
 export function createMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: "CF Account Operator", version: "0.1.0" });
+  const server = new McpServer({ name: "CF Account Operator", version: "0.2.0" });
+
+  server.registerTool(
+    "account_backend_status",
+    {
+      description: "Report the browser backend order. This deployed server is the cf fallback in cdp > cua > cf.",
+      inputSchema: {},
+    },
+    async () => output({ activeBackend: "cf", priority: BACKEND_PRIORITY }),
+  );
 
   server.registerTool(
     "account_upsert",
@@ -138,6 +148,68 @@ export function createMcpServer(env: Env): McpServer {
       }
       try {
         const result = await callCoordinator(env, accountId, "/draft/create", { taskId, title, body });
+        await updateTask(env, taskId, "succeeded", result);
+        return output(result);
+      } catch (error) {
+        await updateTask(env, taskId, "failed", undefined, error instanceof Error ? error.message : String(error));
+        throw error;
+      }
+    },
+  );
+
+  server.registerTool(
+    "note_posts_list",
+    {
+      description: "Read published note links from a creator page through the rendered DOM.",
+      inputSchema: {
+        accountId: z.string(),
+        creatorUrl: z.string().url(),
+        limit: z.number().int().min(1).max(100).default(20),
+      },
+    },
+    async ({ accountId, creatorUrl, limit }) => {
+      await requireAccount(env, accountId);
+      const taskId = crypto.randomUUID();
+      await createTask(env, { id: taskId, accountId, kind: "note_posts_list", status: "running" });
+      try {
+        const result = await callCoordinator(env, accountId, "/posts/list", { taskId, creatorUrl, limit });
+        await updateTask(env, taskId, "succeeded", result);
+        return output(result);
+      } catch (error) {
+        await updateTask(env, taskId, "failed", undefined, error instanceof Error ? error.message : String(error));
+        throw error;
+      }
+    },
+  );
+
+  server.registerTool(
+    "note_publish",
+    {
+      description: "Publish a note through the rendered UI. Requires explicit confirm=true.",
+      inputSchema: {
+        accountId: z.string(),
+        title: z.string().min(1).max(200),
+        body: z.string().min(1).max(200_000),
+        confirm: z.literal(true),
+        idempotencyKey: z.string().min(8).max(200),
+      },
+    },
+    async ({ accountId, title, body, idempotencyKey }) => {
+      await requireAccount(env, accountId);
+      const taskId = crypto.randomUUID();
+      try {
+        await createTask(env, { id: taskId, accountId, kind: "note_publish", status: "running", idempotencyKey });
+      } catch {
+        const existing = await env.DB.prepare(
+          "SELECT id FROM tasks WHERE account_id = ? AND idempotency_key = ?",
+        )
+          .bind(accountId, idempotencyKey)
+          .first<{ id: string }>();
+        if (!existing) throw new Error("Could not create task");
+        return output(await getTask(env, existing.id));
+      }
+      try {
+        const result = await callCoordinator(env, accountId, "/publish", { taskId, title, body });
         await updateTask(env, taskId, "succeeded", result);
         return output(result);
       } catch (error) {
